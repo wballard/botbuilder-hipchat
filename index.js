@@ -74,10 +74,13 @@ module.exports =
                   dialogArgs: {}
                 })
                 // precreated since the memory store isn't actually async, this is where
-                // it is time to send a message back up to the server
+                // it is time to send a message back up to the server after we make sure the
+                // session state is all updated
                 ses.on('send', (msg) => {
-                  backToServer.onNext(new XmppClient.Stanza('message', {to: stanza.from, type: 'chat'})
-                    .c('body').t(msg.text))
+                  this.options.sessionStore.get(stanza.from, (err, data) => {
+                    backToServer.onNext(new XmppClient.Stanza('message', {to: stanza.from, type: 'chat'})
+                      .c('body').t(msg.text))
+                  })
                 })
                 this.options.sessionStore.get(stanza.from, (err, data) => {
                   if (err)
