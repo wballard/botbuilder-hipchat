@@ -16,12 +16,12 @@ Errors fire an `error` event, or if there is no handler, stream to `console.erro
 */
 module.exports =
   class HipchatBot extends botframework.DialogCollection {
-    constructor (options) {
+    constructor(options) {
       super(options)
       this.options = options
     }
 
-    connect () {
+    connect() {
       return new XmppClient({
         jid: this.options.uid,
         password: this.options.pwd,
@@ -30,7 +30,7 @@ module.exports =
     }
 
     // take 'iq' infor query messages and turn them into local state
-    info (stanza) {
+    info(stanza) {
       let vCard = stanza.getChild('vCard')
       if (vCard) {
         this.profile = {}
@@ -38,7 +38,7 @@ module.exports =
       }
     }
 
-    listen () {
+    listen() {
       const client = this.connect()
       this.subscription =
         Rx.Observable.merge(
@@ -47,12 +47,16 @@ module.exports =
             .map(() => new XmppClient.Stanza('iq', { type: 'get' })
               .c('vCard', { xmlns: 'vcard-temp' }))
           ,
+          // keep alive with a nice empty message
+          Rx.Observable.interval(30 * 1000)
+            .map(() => new XmppClient.Message())
+          ,
           // stanzas are messages from the server
           Rx.Observable.fromEvent(client, 'stanza')
             .map((stanza) => {
               if (Object.is(stanza.name, 'iq')) {
                 this.info(stanza)
-                return new XmppClient.Stanza('presence', { })
+                return new XmppClient.Stanza('presence', {})
                   .c('show').t('chat').up()
                   .c('status').t(this.options.status || '')
               }
@@ -64,10 +68,11 @@ module.exports =
           // events making it out to here are stanzas to send along to the server
           .filter((isStanza) => isStanza instanceof XmppClient.Element)
           .do((stanza) => {
+            console.error('-->')
             client.send(stanza)
           })
           // fire up the subscription and start processing events
           .subscribe()
     }
 
-}
+  }
