@@ -22,18 +22,20 @@ let bot = new HipchatBot({
 })
 
 bot.add('/', function (session) {
-  if (!session.userData.name) {
-    session.beginDialog('/profile')
+  if (!session.userData.identity || !session.userData.identity.name) {
+    session.beginDialog('/ask')
   } else {
-    session.send('Hello %s!', session.userData.name)
+    session.send('Hello %s!', session.userData.identity.name)
+    session.beginDialog('/ask')
   }
 })
-bot.add('/profile', [
+bot.add('/ask', [
   function (session) {
-    builder.Prompts.text(session, 'Hi! What is your name?')
+    builder.Prompts.text(session, 'What is up?')
   },
   function (session, results) {
-    session.userData.name = results.response
+    session.userData.sup = results.response
+    session.send('so %s!', session.userData.sup)
     session.endDialog()
   }
 ])

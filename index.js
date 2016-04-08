@@ -37,18 +37,16 @@ module.exports =
         password: this.options.pwd,
         host: this.options.host
       })
-      // little bit of namespace hoisting
-      let sessionStore = this.options.sessionStore
-      let userStore = this.options.userStore
       // reach back to the server, this is a 'republish point' where messages
       // being processed can generate additional observable messages
       let backToServer = new Rx.Subject()
+      this.directory = {}
       this.outgoing =
         backToServer
           // events making it out to here are stanzas to send along to the server
           .filter((isStanza) => isStanza instanceof XmppClient.Element)
           .do((stanza) => {
-            console.error('keepalive')
+            console.error('transmit to server')
             client.send(stanza)
           })
           // fire up the subscription and start processing events
@@ -58,27 +56,40 @@ module.exports =
         Rx.Observable.merge(
           // online? go and get the profile for the bot
           Rx.Observable.fromEvent(client, 'online')
-            .map(() => new XmppClient.Stanza('iq', { type: 'get' })
-              .c('vCard', { xmlns: 'vcard-temp' }))
+            .do(() => {
+              backToServer.onNext(new XmppClient.Stanza('iq', { type: 'get' }).c('vCard', { xmlns: 'vcard-temp' }))
+              backToServer.onNext(new XmppClient.Stanza('iq', { type: 'get' }).c('query', { xmlns: 'jabber:iq:roster' }))
+              backToServer.onNext(new XmppClient.Stanza('presence', {}).c('show').t('chat').up().c('status').t(this.options.status || ''))
+            })
           ,
           // keep alive with a nice empty message
           Rx.Observable.interval(30 * 1000)
-            .map(() => new XmppClient.Message())
+            .do(() => backToServer.onNext(new XmppClient.Message()))
           ,
           // stanzas are messages from the server
           Rx.Observable.fromEvent(client, 'stanza')
             // informational queries come back with an online status
             .do((stanza) => {
               if (Object.is(stanza.name, 'iq')) {
+                // the vcard for the bot itself
                 let vCard = stanza.getChild('vCard')
                 if (vCard) {
                   this.profile = {}
                   vCard.children.forEach((field) => this.profile[field.name] = field.getText())
                 }
-                backToServer.onNext(
-                  new XmppClient.Stanza('presence', {})
-                    .c('show').t('chat').up()
-                    .c('status').t(this.options.status || ''))
+                // the directory, load it all up in a hash
+                let query = stanza.getChild('query')
+                if (query) {
+                  (query.getChildren('item') || []).forEach((el) => {
+                    let buddy = {
+                      jid: new XmppClient.JID(el.attrs.jid),
+                      name: el.attrs.name,
+                      // name used to @mention this user
+                      mention_name: el.attrs.mention_name
+                    }
+                    this.directory[buddy.jid.toString()] = buddy
+                  })
+                }
               }
             })
             // messages add to a dialog session, which triggers all the middleware
@@ -104,8 +115,8 @@ module.exports =
                   .do((msg) => {
                     console.error(JSON.stringify(msg))
                     Rx.Observable.forkJoin(
-                      Rx.Observable.fromNodeCallback(sessionStore.save, sessionStore)(stanza.from, ses.sessionState),
-                      Rx.Observable.fromNodeCallback(userStore.save, userStore)(stanza.from, ses.userData),
+                      Rx.Observable.fromNodeCallback(this.options.sessionStore.save, this.options.sessionStore)(stanza.from, ses.sessionState),
+                      Rx.Observable.fromNodeCallback(this.options.userStore.save, this.options.userStore)(stanza.from, ses.userData),
                       (sessionData, userData) => {
                         console.error('transmit')
                         backToServer.onNext(new XmppClient.Stanza('message', {to: stanza.from, type: 'chat'})
@@ -115,11 +126,13 @@ module.exports =
                   }).subscribe()
                 // observe session and user data, then dispatch a message
                 Rx.Observable.forkJoin(
-                  Rx.Observable.fromNodeCallback(sessionStore.get, sessionStore)(stanza.from),
-                  Rx.Observable.fromNodeCallback(userStore.get, userStore)(stanza.from),
+                  Rx.Observable.fromNodeCallback(this.options.sessionStore.get, this.options.sessionStore)(stanza.from),
+                  Rx.Observable.fromNodeCallback(this.options.userStore.get, this.options.userStore)(stanza.from),
                   (sessionData, userData) => {
                     console.error('dispatch')
                     ses.userData = userData || {}
+                    // pull in the user from the directory
+                    ses.userData.identity = this.directory[stanza.from.bare().toString()]
                     ses.dispatch(sessionData, stanza)
                   }
                 ).subscribe()
