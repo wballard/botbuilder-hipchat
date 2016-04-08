@@ -3,6 +3,7 @@
 const botframework = require('botbuilder')
 const XmppClient = require('node-xmpp-client')
 const Rx = require('rx')
+const uuid = require('node-uuid')
 
 /*
 HipchatBot connects over XMPP to the HipChat servers. The simple use is a
@@ -20,21 +21,40 @@ module.exports =
       super(options)
       this.options = options
       this.options.defaultDialogId = '/'
-      this.options.sessionStore = new botframework.MemoryStorage()
+      this.options.sessionStore = options.sessionStore || new botframework.MemoryStorage()
+      this.options.userStore = options.userStore || new botframework.MemoryStorage()
     }
 
-    connect () {
-      return new XmppClient({
+    /*
+    Build up a new connection with the options, and hook it to
+    a reactive pipeline. The idea here is that if we get an interrupt, the
+    program can exit and restart to reconnect.
+    */
+    listen () {
+      // actual connection
+      const client = new XmppClient({
         jid: this.options.uid,
         password: this.options.pwd,
         host: this.options.host
       })
-    }
-
-    listen () {
-      const client = this.connect()
+      // little bit of namespace hoisting
+      let sessionStore = this.options.sessionStore
+      let userStore = this.options.userStore
+      // reach back to the server, this is a 'republish point' where messages
+      // being processed can generate additional observable messages
       let backToServer = new Rx.Subject()
-      this.subscription =
+      this.outgoing =
+        backToServer
+          // events making it out to here are stanzas to send along to the server
+          .filter((isStanza) => isStanza instanceof XmppClient.Element)
+          .do((stanza) => {
+            console.error('keepalive')
+            client.send(stanza)
+          })
+          // fire up the subscription and start processing events
+          .subscribe()
+
+      this.incoming =
         Rx.Observable.merge(
           // online? go and get the profile for the bot
           Rx.Observable.fromEvent(client, 'online')
@@ -47,8 +67,8 @@ module.exports =
           ,
           // stanzas are messages from the server
           Rx.Observable.fromEvent(client, 'stanza')
+            // informational queries come back with an online status
             .do((stanza) => {
-              // informational queries come back with an online status
               if (Object.is(stanza.name, 'iq')) {
                 let vCard = stanza.getChild('vCard')
                 if (vCard) {
@@ -60,48 +80,53 @@ module.exports =
                     .c('show').t('chat').up()
                     .c('status').t(this.options.status || ''))
               }
-              // messages add to a dialog session
-              // Message without body is probably a typing notification, but in any case
-              // there is not much to say in response
+            })
+            // messages add to a dialog session, which triggers all the middleware
+            // Message without body is probably a typing notification, but in any case
+            // there is not much to say in response
+            .do((stanza) => {
               if (Object.is(stanza.name, 'message') && Object.is(stanza.attrs.type, 'chat') && stanza.getChildText('body')) {
+                // hoisting properties
+                stanza.id = uuid.v1()
                 stanza.to = new XmppClient.JID(stanza.attrs.to)
                 stanza.from = new XmppClient.JID(stanza.attrs.from)
                 stanza.text = stanza.getChildText('body')
-                let ses = new botframework.Session({
+                const ses = new botframework.Session({
                   localizer: this.options.localizer,
                   dialogs: this,
                   dialogId: this.options.defaultDialogId,
                   dialogArgs: {}
                 })
-                // precreated since the memory store isn't actually async, this is where
-                // it is time to send a message back up to the server after we make sure the
-                // session state is all updated
-                ses.on('send', (msg) => {
-                  this.options.sessionStore.get(stanza.from, (err, data) => {
-                    backToServer.onNext(new XmppClient.Stanza('message', {to: stanza.from, type: 'chat'})
-                      .c('body').t(msg.text))
-                  })
-                })
-                this.options.sessionStore.get(stanza.from, (err, data) => {
-                  if (err)
-                    ses.dispatch(null, stanza)
-                  else
-                    ses.dispatch(data, stanza)
-                })
+                // observe the session, and forward sends back to the server after saving data
+                // created first -- memory store appears to be synchronous, otherwise the 'send' is not
+                // trapped
+                Rx.Observable.fromEvent(ses, 'send')
+                  .do((msg) => {
+                    console.error(JSON.stringify(msg))
+                    Rx.Observable.forkJoin(
+                      Rx.Observable.fromNodeCallback(sessionStore.save, sessionStore)(stanza.from, ses.sessionState),
+                      Rx.Observable.fromNodeCallback(userStore.save, userStore)(stanza.from, ses.userData),
+                      (sessionData, userData) => {
+                        console.error('transmit')
+                        backToServer.onNext(new XmppClient.Stanza('message', {to: stanza.from, type: 'chat'})
+                          .c('body').t(msg.text))
+                      }
+                    ).subscribe()
+                  }).subscribe()
+                // observe session and user data, then dispatch a message
+                Rx.Observable.forkJoin(
+                  Rx.Observable.fromNodeCallback(sessionStore.get, sessionStore)(stanza.from),
+                  Rx.Observable.fromNodeCallback(userStore.get, userStore)(stanza.from),
+                  (sessionData, userData) => {
+                    console.error('dispatch')
+                    ses.userData = userData || {}
+                    ses.dispatch(sessionData, stanza)
+                  }
+                ).subscribe()
               }
-            })
-            // all processed, do not forward stanzas from the server, anything to go back to the server
-            // needs to be `backToServer.onNext`
-            .filter(() => false)
-          ,
-          backToServer
+            }
+          )
         )
-          // events making it out to here are stanzas to send along to the server
-          .filter((isStanza) => isStanza instanceof XmppClient.Element)
-          .do((stanza) => {
-            console.error('-->')
-            client.send(stanza)
-          })
           // fire up the subscription and start processing events
           .subscribe()
     }
