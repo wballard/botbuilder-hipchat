@@ -107,7 +107,7 @@ module.exports =
                   try {
                     buddy.name = stanza.getChildren('query')[0].getChildren('name')[0].children[0]
                     buddy.mention_name = stanza.getChildren('query')[0].getChildren('mention_name')[0].children[0]
-                    buddy.timezone = stanza.getChildren('query')[0].getChildren('timezone')[0].attrs.utc_offset
+                    buddy.timezone = Number(stanza.getChildren('query')[0].getChildren('timezone')[0].attrs.utc_offset)
                   } catch(e) {
                     console.error(e)
                   }
