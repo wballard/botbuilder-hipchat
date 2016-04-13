@@ -23,16 +23,23 @@ module.exports =
       this.options.defaultDialogId = '/'
       this.options.sessionStore = options.sessionStore || new botframework.MemoryStorage()
       this.options.userStore = options.userStore || new botframework.MemoryStorage()
+      // promises resolvers from the future -- for message callbacks from XMPP since we can't really
+      // get a closure over it -- key these by message id
+      this.resolvers = {}
+
     }
 
     /*
-    Ask for a full profile by jid. 
+    Ask for a full profile by jid, come back with a promise for the full profile.
     */
     fullProfile (jid) {
-      let id = `profile:${jid.bare().toString()}`
-      this.backToServer.onNext(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
-        .c('query', {xmlns: 'http://hipchat.com/protocol/profile'})
-        .up().c('time', {xmlns: 'urn:xmpp:time'}))
+      return new Promise((resolve) => {
+        let id = `profile:${uuid.v1()}`
+        this.resolvers[id] = resolve;
+        this.backToServer.onNext(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
+          .c('query', {xmlns: 'http://hipchat.com/protocol/profile'})
+          .up().c('time', {xmlns: 'urn:xmpp:time'}))
+      })
     }
 
     /*
@@ -78,7 +85,7 @@ module.exports =
           ,
           // stanzas are messages from the server
           Rx.Observable.fromEvent(client, 'stanza')
-            // informational queries come back with an online status
+            // informational queries come back and need to be parsed
             .do((stanza) => {
               if (Object.is(stanza.name, 'iq')) {
                 // the vcard for the bot itself
@@ -106,6 +113,8 @@ module.exports =
                   }
                   console.error('hi', JSON.stringify(buddy))
                   this.directory[jid.bare().toString()] = buddy
+                  let resolver = this.resolvers[stanza.attrs.id]
+                  if (resolver) resolver(buddy)
                 }
                 // the directory, load it all up in a hash
                 let query = stanza.getChild('query')
