@@ -30,7 +30,7 @@ module.exports =
     */
     fullProfile (jid) {
       let id = `profile:${jid.bare().toString()}`
-      backToServer.onNext(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
+      this.backToServer.onNext(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
         .c('query', {xmlns: 'http://hipchat.com/protocol/profile'})
         .up().c('time', {xmlns: 'urn:xmpp:time'}))
     }
