@@ -26,6 +26,16 @@ module.exports =
     }
 
     /*
+    Ask for a full profile by jid. 
+    */
+    fullProfile (jid) {
+      let id = `profile:${jid.bare().toString()}`
+      backToServer.onNext(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
+        .c('query', {xmlns: 'http://hipchat.com/protocol/profile'})
+        .up().c('time', {xmlns: 'urn:xmpp:time'}))
+    }
+
+    /*
     Build up a new connection with the options, and hook it to
     a reactive pipeline. The idea here is that if we get an interrupt, the
     program can exit and restart to reconnect.
@@ -39,7 +49,7 @@ module.exports =
       })
       // reach back to the server, this is a 'republish point' where messages
       // being processed can generate additional observable messages
-      let backToServer = new Rx.Subject()
+      let backToServer = this.backToServer = new Rx.Subject()
       this.directory = {}
       this.outgoing =
         backToServer
@@ -77,17 +87,37 @@ module.exports =
                   this.profile = {}
                   vCard.children.forEach((field) => this.profile[field.name] = field.getText())
                 }
+                // may be a single person, look them up or make a profile record
+                if ((stanza.attrs.id || '').indexOf('profile:') == 0) {
+                  let jid = new XmppClient.JID(stanza.attrs.from)
+                  let buddy = undefined
+                  if (this.directory[jid.bare().toString()]) {
+                    buddy = this.directory[jid.bare().toString()]
+                  } else {
+                    buddy = {}
+                  }
+                  buddy.jid = jid
+                  try {
+                    buddy.name = stanza.getChildren('query')[0].getChildren('name')[0].children[0]
+                    buddy.mention_name = stanza.getChildren('query')[0].getChildren('mention_name')[0].children[0]
+                    buddy.timezone = stanza.getChildren('query')[0].getChildren('timezone')[0].attrs.utc_offset
+                  } catch(e) {
+                    console.error(e)
+                  }
+                  console.error('hi', JSON.stringify(buddy))
+                  this.directory[jid.bare().toString()] = buddy
+                }
                 // the directory, load it all up in a hash
                 let query = stanza.getChild('query')
-                if (query) {
+                if (query && query.getChildren('item')) {
                   (query.getChildren('item') || []).forEach((el) => {
-                    let buddy = {
-                      jid: new XmppClient.JID(el.attrs.jid),
-                      name: el.attrs.name,
-                      // name used to @mention this user
-                      mention_name: el.attrs.mention_name
-                    }
-                    this.directory[buddy.jid.toString()] = buddy
+                    let jid = new XmppClient.JID(el.attrs.jid)
+                    let buddy = this.directory[jid.bare().toString()] || {}
+                    buddy.jid = jid
+                    buddy.name = el.attrs.name
+                    buddy.mention_name = el.attrs.mention_name
+                    console.error('hi', JSON.stringify(buddy))
+                    this.directory[jid.bare().toString()] = buddy
                   })
                 }
               }
@@ -98,6 +128,7 @@ module.exports =
             .do((stanza) => {
               if (Object.is(stanza.name, 'message') && Object.is(stanza.attrs.type, 'chat') && stanza.getChildText('body')) {
                 // hoisting properties
+                console.error(JSON.stringify(stanza))
                 stanza.id = uuid.v1()
                 stanza.to = new XmppClient.JID(stanza.attrs.to)
                 stanza.from = new XmppClient.JID(stanza.attrs.from)
@@ -112,15 +143,16 @@ module.exports =
                 // created first -- memory store appears to be synchronous, otherwise the 'send' is not
                 // trapped
                 Rx.Observable.fromEvent(ses, 'send')
+                  .filter((msg) => msg)
                   .do((msg) => {
-                    console.error(JSON.stringify(msg))
                     Rx.Observable.forkJoin(
                       Rx.Observable.fromNodeCallback(this.options.sessionStore.save, this.options.sessionStore)(stanza.from, ses.sessionState),
                       Rx.Observable.fromNodeCallback(this.options.userStore.save, this.options.userStore)(stanza.from, ses.userData),
                       (sessionData, userData) => {
                         console.error('transmit')
-                        backToServer.onNext(new XmppClient.Stanza('message', {to: stanza.from, type: 'chat'})
-                          .c('body').t(msg.text))
+                        let backToWho = this.directory[stanza.from.bare().toString()]
+                        backToServer.onNext(new XmppClient.Stanza('message', {id: uuid.v1(), to: stanza.from, type: 'chat'})
+                          .c('body').t(msg.text).root().c('time', {xmlns: 'urn:xmpp:time'}))
                       }
                     ).subscribe()
                   }).subscribe()
