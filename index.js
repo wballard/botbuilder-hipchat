@@ -19,7 +19,7 @@ Errors fire an `error` event, or if there is no handler, stream to `console.erro
 module.exports =
   class HipchatBot extends botframework.DialogCollection {
     constructor (options) {
-      super(options)
+      super()
       this.options = options
       this.options.defaultDialogId = '/'
       this.options.sessionStore = options.sessionStore || new botframework.MemoryStorage()
