@@ -17,6 +17,7 @@
   },
   "homepage": "https://github.com/wballard/botbuilder-hipchat#readme",
   "dependencies": {
+    "bluebird": "^3.3.5",
     "botbuilder": "^0.6.5",
     "dotenv": "^2.0.0",
     "node-xmpp-client": "^3.0.0",

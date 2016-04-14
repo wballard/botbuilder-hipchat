@@ -2,8 +2,9 @@
 
 const botframework = require('botbuilder')
 const XmppClient = require('node-xmpp-client')
-const Rx = require('rx')
 const uuid = require('node-uuid')
+const Promise = require('bluebird')
+const debug = require('debug')('botbuilder-hipchat')
 
 /*
 HipchatBot connects over XMPP to the HipChat servers. The simple use is a
@@ -26,163 +27,179 @@ module.exports =
       // promises resolvers from the future -- for message callbacks from XMPP since we can't really
       // get a closure over it -- key these by message id
       this.resolvers = {}
-
+      this.directory = {}
+      this.profile = {}
     }
 
     /*
     Ask for a full profile by jid, come back with a promise for the full profile.
     */
     fullProfile (jid) {
+      let resolvers = this.resolvers
+      let client = this.client
       return new Promise((resolve) => {
         let id = `profile:${uuid.v1()}`
-        this.resolvers[id] = resolve;
-        this.backToServer.onNext(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
+        resolvers[id] = resolve
+        client.send(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
           .c('query', {xmlns: 'http://hipchat.com/protocol/profile'})
-          .up().c('time', {xmlns: 'urn:xmpp:time'}))
+          .up().c('time', {xmlns: 'urn:xmpp:time'}).root())
       })
     }
 
-    /*
-    Build up a new connection with the options, and hook it to
-    a reactive pipeline. The idea here is that if we get an interrupt, the
-    program can exit and restart to reconnect.
-    */
+    /**
+     * Process if the stanza is a vcard, returning true if it was handled.
+     * 
+     * @param stanza
+     */
+    maybeVCard (stanza) {
+      if (Object.is(stanza.name, 'iq') && stanza.getChild('vCard')) {
+        stanza.getChild('vCard').children.forEach((field) => this.profile[field.name] = field.getText())
+        return true
+      }
+    }
+
+    /**
+     * Process a single profile coming back from the server, merging it into the directory, and if
+     * there is an outstanding promise for this profile -- resolve it.
+     * 
+     * @param stanza
+     */
+    maybeProfile (stanza) {
+      // may be a single person, look them up or make a profile record
+      if (Object.is(stanza.name, 'iq') && (stanza.attrs.id || '').indexOf('profile:') == 0) {
+        let jid = new XmppClient.JID(stanza.attrs.from)
+        let buddy = undefined
+        if (this.directory[jid.bare().toString()]) {
+          buddy = this.directory[jid.bare().toString()]
+        } else {
+          buddy = {}
+        }
+        buddy.jid = jid
+        try {
+          buddy.name = stanza.getChildren('query')[0].getChildren('name')[0].children[0]
+          buddy.mention_name = stanza.getChildren('query')[0].getChildren('mention_name')[0].children[0]
+          buddy.timezone = Number(stanza.getChildren('query')[0].getChildren('timezone')[0].attrs.utc_offset)
+        } catch(e) {
+          this.emit('error', e)
+        }
+        debug('hi', JSON.stringify(buddy))
+        this.directory[jid.bare().toString()] = buddy
+        let resolver = this.resolvers[stanza.attrs.id]
+        if (resolver) resolver(buddy)
+        return true
+      }
+    }
+
+    /**
+     * Process a a query result having other users in he buddly list subscription
+     * 
+     * @param stanza
+     */
+    maybeBuddyList (stanza) {
+      // the directory, load it all up in a hash
+      let query = stanza.getChild('query')
+      if (query && query.getChildren('item')) {
+        (query.getChildren('item') || []).forEach((el) => {
+          let jid = new XmppClient.JID(el.attrs.jid)
+          let buddy = this.directory[jid.bare().toString()] || {}
+          buddy.jid = jid
+          buddy.name = el.attrs.name
+          buddy.mention_name = el.attrs.mention_name
+          debug('hi', JSON.stringify(buddy))
+          this.directory[jid.bare().toString()] = buddy
+        })
+        return true
+      }
+    }
+
+    /**
+     * Process a plain chat message, this hooks into a bot dialog session based on the user.
+     * 
+     * @param stanza 
+     */
+    maybeMessage (stanza) {
+      if (Object.is(stanza.name, 'message') && Object.is(stanza.attrs.type, 'chat') && stanza.getChildText('body')) {
+        // hoisting properties
+        stanza.id = uuid.v1()
+        stanza.to = new XmppClient.JID(stanza.attrs.to)
+        stanza.from = new XmppClient.JID(stanza.attrs.from)
+        stanza.text = stanza.getChildText('body')
+        const ses = new botframework.Session({
+          localizer: this.options.localizer,
+          dialogs: this,
+          dialogId: this.options.defaultDialogId,
+          dialogArgs: {}
+        })
+        let getSession = Promise.promisify(this.options.sessionStore.get.bind(this.options.sessionStore))
+        let getUser = Promise.promisify(this.options.userStore.get.bind(this.options.userStore))
+        Promise.join(
+          getSession(stanza.from.bare().toString()),
+          getUser(stanza.from.bare().toString())
+        ).then((arg) => {
+          let sessionData = arg[0]
+          let userData = arg[1]
+          ses.userData = userData || {}
+          // pull in the user from the directory
+          ses.userData.identity = this.directory[stanza.from.bare().toString()]
+          ses.dispatch(sessionData, stanza)
+        })
+        // observe the session, and forward sends back to the server after saving data
+        // created first -- memory store appears to be synchronous, otherwise the 'send' is not
+        // trapped
+        ses.on('send', (msg) => {
+          if (!msg) return
+          let setSession = Promise.promisify(this.options.sessionStore.save.bind(this.options.sessionStore))
+          let setUser = Promise.promisify(this.options.userStore.save.bind(this.options.userStore))
+          Promise.join(
+            setSession(stanza.from.bare().toString(), ses.sessionState),
+            setUser(stanza.from.bare().toString(), ses.userData)
+          ).then(() => {
+            let backToWho = this.directory[stanza.from.bare().toString()]
+            this.client.send(new XmppClient.Stanza('message', {id: uuid.v1(), to: stanza.from, type: 'chat'})
+              .c('body').t(msg.text).root().c('time', {xmlns: 'urn:xmpp:time'}))
+            this.emit('send', msg)
+          })
+        })
+        return true
+      }
+    }
+
+    /**
+     * Build up a new connection with the options, and hook it event handlers
+     * 
+     * @returns {Promise} - resolved when this client connection is online.
+     */
     listen () {
       // actual connection
-      const client = new XmppClient({
+      let client = this.client = new XmppClient({
         jid: this.options.uid,
         password: this.options.pwd,
         host: this.options.host
       })
-      // reach back to the server, this is a 'republish point' where messages
-      // being processed can generate additional observable messages
-      let backToServer = this.backToServer = new Rx.Subject()
-      this.directory = {}
-      this.outgoing =
-        backToServer
-          // events making it out to here are stanzas to send along to the server
-          .filter((isStanza) => isStanza instanceof XmppClient.Element)
-          .do((stanza) => {
-            console.error('transmit to server')
-            client.send(stanza)
-          })
-          // fire up the subscription and start processing events
-          .subscribe()
+      // event processing for incoming stanzas from the server
+      client.on('stanza', (stanza) => {
+        this.maybeVCard(stanza) ||
+        this.maybeProfile(stanza) ||
+        this.maybeBuddyList(stanza) ||
+        this.maybeMessage(stanza)
+      })
 
-      this.incoming =
-        Rx.Observable.merge(
-          // online? go and get the profile for the bot
-          Rx.Observable.fromEvent(client, 'online')
-            .do(() => {
-              backToServer.onNext(new XmppClient.Stanza('iq', { type: 'get' }).c('vCard', { xmlns: 'vcard-temp' }))
-              backToServer.onNext(new XmppClient.Stanza('iq', { type: 'get' }).c('query', { xmlns: 'jabber:iq:roster' }))
-              backToServer.onNext(new XmppClient.Stanza('presence', {}).c('show').t('chat').up().c('status').t(this.options.status || ''))
-            })
-          ,
-          // keep alive with a nice empty message
-          Rx.Observable.interval(30 * 1000)
-            .do(() => backToServer.onNext(new XmppClient.Message()))
-          ,
-          // stanzas are messages from the server
-          Rx.Observable.fromEvent(client, 'stanza')
-            // informational queries come back and need to be parsed
-            .do((stanza) => {
-              if (Object.is(stanza.name, 'iq')) {
-                // the vcard for the bot itself
-                let vCard = stanza.getChild('vCard')
-                if (vCard) {
-                  this.profile = {}
-                  vCard.children.forEach((field) => this.profile[field.name] = field.getText())
-                }
-                // may be a single person, look them up or make a profile record
-                if ((stanza.attrs.id || '').indexOf('profile:') == 0) {
-                  let jid = new XmppClient.JID(stanza.attrs.from)
-                  let buddy = undefined
-                  if (this.directory[jid.bare().toString()]) {
-                    buddy = this.directory[jid.bare().toString()]
-                  } else {
-                    buddy = {}
-                  }
-                  buddy.jid = jid
-                  try {
-                    buddy.name = stanza.getChildren('query')[0].getChildren('name')[0].children[0]
-                    buddy.mention_name = stanza.getChildren('query')[0].getChildren('mention_name')[0].children[0]
-                    buddy.timezone = Number(stanza.getChildren('query')[0].getChildren('timezone')[0].attrs.utc_offset)
-                  } catch(e) {
-                    console.error(e)
-                  }
-                  console.error('hi', JSON.stringify(buddy))
-                  this.directory[jid.bare().toString()] = buddy
-                  let resolver = this.resolvers[stanza.attrs.id]
-                  if (resolver) resolver(buddy)
-                }
-                // the directory, load it all up in a hash
-                let query = stanza.getChild('query')
-                if (query && query.getChildren('item')) {
-                  (query.getChildren('item') || []).forEach((el) => {
-                    let jid = new XmppClient.JID(el.attrs.jid)
-                    let buddy = this.directory[jid.bare().toString()] || {}
-                    buddy.jid = jid
-                    buddy.name = el.attrs.name
-                    buddy.mention_name = el.attrs.mention_name
-                    console.error('hi', JSON.stringify(buddy))
-                    this.directory[jid.bare().toString()] = buddy
-                  })
-                }
-              }
-            })
-            // messages add to a dialog session, which triggers all the middleware
-            // Message without body is probably a typing notification, but in any case
-            // there is not much to say in response
-            .do((stanza) => {
-              if (Object.is(stanza.name, 'message') && Object.is(stanza.attrs.type, 'chat') && stanza.getChildText('body')) {
-                // hoisting properties
-                console.error(JSON.stringify(stanza))
-                stanza.id = uuid.v1()
-                stanza.to = new XmppClient.JID(stanza.attrs.to)
-                stanza.from = new XmppClient.JID(stanza.attrs.from)
-                stanza.text = stanza.getChildText('body')
-                const ses = new botframework.Session({
-                  localizer: this.options.localizer,
-                  dialogs: this,
-                  dialogId: this.options.defaultDialogId,
-                  dialogArgs: {}
-                })
-                // observe the session, and forward sends back to the server after saving data
-                // created first -- memory store appears to be synchronous, otherwise the 'send' is not
-                // trapped
-                Rx.Observable.fromEvent(ses, 'send')
-                  .filter((msg) => msg)
-                  .do((msg) => {
-                    Rx.Observable.forkJoin(
-                      Rx.Observable.fromNodeCallback(this.options.sessionStore.save, this.options.sessionStore)(stanza.from, ses.sessionState),
-                      Rx.Observable.fromNodeCallback(this.options.userStore.save, this.options.userStore)(stanza.from, ses.userData),
-                      (sessionData, userData) => {
-                        console.error('transmit')
-                        let backToWho = this.directory[stanza.from.bare().toString()]
-                        backToServer.onNext(new XmppClient.Stanza('message', {id: uuid.v1(), to: stanza.from, type: 'chat'})
-                          .c('body').t(msg.text).root().c('time', {xmlns: 'urn:xmpp:time'}))
-                      }
-                    ).subscribe()
-                  }).subscribe()
-                // observe session and user data, then dispatch a message
-                Rx.Observable.forkJoin(
-                  Rx.Observable.fromNodeCallback(this.options.sessionStore.get, this.options.sessionStore)(stanza.from),
-                  Rx.Observable.fromNodeCallback(this.options.userStore.get, this.options.userStore)(stanza.from),
-                  (sessionData, userData) => {
-                    console.error('dispatch')
-                    ses.userData = userData || {}
-                    // pull in the user from the directory
-                    ses.userData.identity = this.directory[stanza.from.bare().toString()]
-                    ses.dispatch(sessionData, stanza)
-                  }
-                ).subscribe()
-              }
-            }
-          )
-        )
-          // fire up the subscription and start processing events
-          .subscribe()
+      // promise for a complete online connection
+      return new Promise((resolve) => {
+        client.on('online', resolve)
+      }).then(() => {
+        // now we are online, start getting roster and status, along with a vcard for this bot itself
+        client.send(new XmppClient.Stanza('iq', { type: 'get' }).c('vCard', { xmlns: 'vcard-temp' }).root())
+        client.send(new XmppClient.Stanza('iq', { type: 'get' }).c('query', { xmlns: 'jabber:iq:roster' }).root())
+        client.send(new XmppClient.Stanza('presence', {}).c('show').t('chat').up().c('status').t(this.options.status || '').root())
+        return true
+      }).then(() => {
+        // and start up a keepalive
+        this.keepalive = setInterval(() => {
+          client.send(new XmppClient.Message())
+        }, 30 * 1000)
+        return true
+      })
     }
 
 }
