@@ -32,8 +32,14 @@ module.exports =
     }
 
     /*
-    Ask for a full profile by jid, come back with a promise for the full profile.
+    
     */
+    /**
+     * Ask for a full profile by jid, come back with a promise for the full profile.* 
+     * 
+     * @param jid - fetch for this user
+     * @returns {Promise} - resolves with the profile
+     */
     fullProfile (jid) {
       let resolvers = this.resolvers
       let client = this.client
@@ -47,7 +53,8 @@ module.exports =
     }
 
     /**
-     * Process if the stanza is a vcard, returning true if it was handled.
+     * Process if the stanza is a vcard, returning true if it was handled. This is the profile for
+     * the bot user itself.
      * 
      * @param stanza
      */
@@ -92,7 +99,8 @@ module.exports =
     }
 
     /**
-     * Process a a query result having other users in he buddly list subscription
+     * Process a query result having other users in the buddly list subscription, this will update
+     * the bot in memory profile directory.
      * 
      * @param stanza
      */
@@ -106,10 +114,27 @@ module.exports =
           buddy.jid = jid
           buddy.name = el.attrs.name
           buddy.mention_name = el.attrs.mention_name
-          debug('hi', JSON.stringify(buddy))
+          debug('profile', JSON.stringify(buddy))
           this.directory[jid.bare().toString()] = buddy
         })
         return true
+      }
+    }
+
+    /**
+     * Check for presence and update the directory.
+     * 
+     * @param stanza (description)
+     */
+    maybePresence (stanza) {
+      if (Object.is(stanza.name, 'presence')) {
+        let jid = new XmppClient.JID(stanza.attrs.from)
+        let buddy = this.directory[jid.bare().toString()] || {}
+        let show = (stanza.getChildren('show') || []).map( (i) => i.getText()).join('')
+        show = show.length ? show : null
+        buddy.presence = show || stanza.attrs.type || 'online'
+        debug('presence', JSON.stringify(buddy))
+        this.directory[jid.bare().toString()] = buddy
       }
     }
 
@@ -221,7 +246,8 @@ module.exports =
         this.maybeVCard(stanza) ||
         this.maybeProfile(stanza) ||
         this.maybeBuddyList(stanza) ||
-        this.maybeMessage(stanza)
+        this.maybeMessage(stanza) ||
+        this.maybePresence(stanza)
       })
 
       // promise for a complete online connection
