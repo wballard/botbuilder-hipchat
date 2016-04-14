@@ -53,6 +53,7 @@ module.exports =
      */
     maybeVCard (stanza) {
       if (Object.is(stanza.name, 'iq') && stanza.getChild('vCard')) {
+        this.profile.jid = new XmppClient.JID(stanza.attrs.to).bare().toString()
         stanza.getChild('vCard').children.forEach((field) => this.profile[field.name] = field.getText())
         return true
       }
@@ -119,11 +120,23 @@ module.exports =
      */
     maybeMessage (stanza) {
       if (Object.is(stanza.name, 'message') && Object.is(stanza.attrs.type, 'chat') && stanza.getChildText('body')) {
+        // check for a resolver, this is an early exit as it is just an echo
+        if (this.resolvers[stanza.attrs.id]) {
+          this.resolvers[stanza.attrs.id]()
+          debug('receipt for', stanza.attrs.id)
+          return true
+        }
         // hoisting properties
         stanza.id = uuid.v1()
         stanza.to = new XmppClient.JID(stanza.attrs.to)
         stanza.from = new XmppClient.JID(stanza.attrs.from)
         stanza.text = stanza.getChildText('body')
+        // if this is a message 'from' the bot-- it is a reply
+        if (Object.is(this.profile.jid, stanza.from.bare().toString())) {
+          this.emit('reply', stanza)
+          return true
+        }
+        // start up a session 
         const ses = new botframework.Session({
           localizer: this.options.localizer,
           dialogs: this,
@@ -155,13 +168,40 @@ module.exports =
             setUser(stanza.from.bare().toString(), ses.userData)
           ).then(() => {
             let backToWho = this.directory[stanza.from.bare().toString()]
-            this.client.send(new XmppClient.Stanza('message', {id: uuid.v1(), to: stanza.from, type: 'chat'})
-              .c('body').t(msg.text).root().c('time', {xmlns: 'urn:xmpp:time'}))
+            this.client.send(
+              new XmppClient.Stanza('message', {id: uuid.v1(), to: stanza.from, type: 'chat'})
+                .c('body')
+                .t(msg.text)
+                .root()
+            )
             this.emit('send', msg)
           })
         })
         return true
       }
+    }
+
+    /**
+     * Send a quick message outside of a dialog session.
+     * 
+     * @param to - JID of the target
+     * @param message - body text for the message
+     * @returns {Promise} - resolved on message receipt
+     */
+    send (to, message) {
+      let id = uuid.v1()
+      this.client.send(
+        new XmppClient.Stanza('message', {id: id, to: new XmppClient.JID(to).bare().toString(), type: 'chat'})
+          .c('body')
+          .t(message)
+          .root()
+          .c('x', {xmlns: 'http://hipchat.com'})
+          .c('echo')
+          .root()
+      )
+      return new Promise((resolve) => {
+        this.resolvers[id] = resolve
+      })
     }
 
     /**
