@@ -27,13 +27,12 @@ module.exports =
       // promises resolvers from the future -- for message callbacks from XMPP since we can't really
       // get a closure over it -- key these by message id
       this.resolvers = {}
+      // all the other users we know
       this.directory = {}
+      // the bot profile
       this.profile = {}
     }
 
-    /*
-    
-    */
     /**
      * Ask for a full profile by jid, come back with a promise for the full profile.* 
      * 
@@ -60,7 +59,7 @@ module.exports =
      */
     maybeVCard (stanza) {
       if (Object.is(stanza.name, 'iq') && stanza.getChild('vCard')) {
-        this.profile.jid = new XmppClient.JID(stanza.attrs.to).bare().toString()
+        this.profile.jid = new XmppClient.JID(stanza.attrs.to)
         stanza.getChild('vCard').children.forEach((field) => this.profile[field.name] = field.getText())
         return true
       }
@@ -86,7 +85,8 @@ module.exports =
         try {
           buddy.name = stanza.getChildren('query')[0].getChildren('name')[0].children[0]
           buddy.mention_name = stanza.getChildren('query')[0].getChildren('mention_name')[0].children[0]
-          buddy.timezone = Number(stanza.getChildren('query')[0].getChildren('timezone')[0].attrs.utc_offset)
+          buddy.timezone = stanza.getChildren('query')[0].getChildren('timezone')[0].text()
+          buddy.utc_offset = Number(stanza.getChildren('query')[0].getChildren('timezone')[0].attrs.utc_offset)
         } catch(e) {
           this.emit('error', e)
         }
@@ -130,7 +130,7 @@ module.exports =
       if (Object.is(stanza.name, 'presence')) {
         let jid = new XmppClient.JID(stanza.attrs.from)
         let buddy = this.directory[jid.bare().toString()] || {}
-        let show = (stanza.getChildren('show') || []).map( (i) => i.getText()).join('')
+        let show = (stanza.getChildren('show') || []).map((i) => i.getText()).join('')
         show = show.length ? show : null
         buddy.presence = show || stanza.attrs.type || 'online'
         debug('presence', JSON.stringify(buddy))
@@ -157,7 +157,7 @@ module.exports =
         stanza.from = new XmppClient.JID(stanza.attrs.from)
         stanza.text = stanza.getChildText('body')
         // if this is a message 'from' the bot-- it is a reply
-        if (Object.is(this.profile.jid, stanza.from.bare().toString())) {
+        if (Object.is(this.profile.jid.bare().toString(), stanza.from.bare().toString())) {
           this.emit('reply', stanza)
           return true
         }
@@ -169,10 +169,9 @@ module.exports =
           dialogArgs: {}
         })
         let getSession = Promise.promisify(this.options.sessionStore.get.bind(this.options.sessionStore))
-        let getUser = Promise.promisify(this.options.userStore.get.bind(this.options.userStore))
         Promise.join(
           getSession(stanza.from.bare().toString()),
-          getUser(stanza.from.bare().toString())
+          this.getUserData(stanza.from)
         ).then((arg) => {
           let sessionData = arg[0]
           let userData = arg[1]
@@ -182,28 +181,72 @@ module.exports =
           ses.dispatch(sessionData, stanza)
         })
         // observe the session, and forward sends back to the server after saving data
-        // created first -- memory store appears to be synchronous, otherwise the 'send' is not
-        // trapped
         ses.on('send', (msg) => {
           if (!msg) return
           let setSession = Promise.promisify(this.options.sessionStore.save.bind(this.options.sessionStore))
-          let setUser = Promise.promisify(this.options.userStore.save.bind(this.options.userStore))
           Promise.join(
             setSession(stanza.from.bare().toString(), ses.sessionState),
-            setUser(stanza.from.bare().toString(), ses.userData)
+            this.setUserData(stanza.from, ses.userData)
           ).then(() => {
             let backToWho = this.directory[stanza.from.bare().toString()]
-            this.client.send(
-              new XmppClient.Stanza('message', {id: uuid.v1(), to: stanza.from, type: 'chat'})
-                .c('body')
-                .t(msg.text)
-                .root()
-            )
+            this.send(stanza.from, msg.text)
             this.emit('send', msg)
           })
         })
         return true
       }
+    }
+
+    
+    /**
+     * This bot is what we'd call 'a joiner'. All invites get an immediate join response to
+     * the room.
+     * 
+     * @param stanza (description)
+     * @returns (description)
+     */
+    maybeInvite (stanza) {
+      var ret = false
+      if (Object.is(stanza.name, 'message')) {
+        stanza.getChildren('x').forEach((x) => {
+          x.getChildren('invite').forEach((invite) => {
+            var room = new XmppClient.JID(stanza.attrs.from)
+            this.client.send(
+              new XmppClient.Stanza('presence', {to: `${room.toString()}/${this.profile.FN}`})
+                .c('x', { xmlns: 'http://jabber.org/protocol/muc' })
+                .c('history', {
+                  xmlns: 'http://jabber.org/protocol/muc',
+                  maxstanzas: '20'
+                })
+                .root()
+            )
+          })
+        })
+      }
+      return ret
+    }
+
+    /**
+     * Promise to get the data for a single user, and always come back with at least a default hash.
+     * 
+     * @param jid - identifies which user
+     * @returns {Promise} - resolves to the user data
+     */
+    getUserData (jid) {
+      return Promise.promisify(this.options.userStore.get.bind(this.options.userStore))(jid.bare().toString())
+        .then((userdata) => userdata || {})
+    }
+
+    /**
+     * Promise to set the data for a single user.
+     * 
+     * @param jid - identifies which user
+     * @param data - the user data profile
+     * @returns {Promise} - resolves to the user data
+     */
+    setUserData (jid, data) {
+      return Promise.promisify(this.options.userStore.save.bind(this.options.userStore))(jid.bare().toString(), data)
+        .then(() => data)
     }
 
     /**
@@ -214,15 +257,17 @@ module.exports =
      * @returns {Promise} - resolved on message receipt
      */
     send (to, message) {
+      to = new XmppClient.JID(to.toString()).bare().toString()
       let id = uuid.v1()
       this.client.send(
-        new XmppClient.Stanza('message', {id: id, to: new XmppClient.JID(to).bare().toString(), type: 'chat'})
+        new XmppClient.Stanza('message', {id, to, type: 'chat'})
           .c('body')
           .t(message)
           .root()
           .c('x', {xmlns: 'http://hipchat.com'})
           .c('echo')
           .root()
+          .c('time', {xmlns: 'urn:xmpp:time'}).root()
       )
       return new Promise((resolve) => {
         this.resolvers[id] = resolve
@@ -247,7 +292,8 @@ module.exports =
         this.maybeProfile(stanza) ||
         this.maybeBuddyList(stanza) ||
         this.maybeMessage(stanza) ||
-        this.maybePresence(stanza)
+        this.maybePresence(stanza) ||
+        this.maybeInvite(stanza)
       })
 
       // promise for a complete online connection
