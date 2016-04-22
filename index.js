@@ -4,6 +4,7 @@ const botframework = require('botbuilder')
 const XmppClient = require('node-xmpp-client')
 const uuid = require('node-uuid')
 const Promise = require('bluebird')
+const _ = require('lodash')
 const debug = require('debug')('botbuilder-hipchat')
 
 /*
@@ -144,20 +145,33 @@ module.exports =
      * @param stanza 
      */
     maybeMessage (stanza) {
-      if (Object.is(stanza.name, 'message') && Object.is(stanza.attrs.type, 'chat') && stanza.getChildText('body')) {
+      let ret = false
+      if (Object.is(stanza.name, 'message') && stanza.getChildText('body') && (Object.is(stanza.attrs.type, 'chat') || Object.is(stanza.attrs.type, 'groupchat'))) {
         // check for a resolver, this is an early exit as it is just an echo
         if (this.resolvers[stanza.attrs.id]) {
           this.resolvers[stanza.attrs.id]()
           debug('receipt for', stanza.attrs.id)
           return true
         }
-        // hoisting properties
+        // the from / to is a bit when we are in groupchat
+        let messageFrom = new XmppClient.JID(stanza.attrs.from)
+        let messageUser
+        if (Object.is(stanza.attrs.type, 'chat')) {
+          messageUser = messageFrom
+        }
+        if (Object.is(stanza.attrs.type, 'groupchat')) {
+          let users = _.values(this.directory)
+          let user = _.find(users, (u) => Object.is(u.name, messageFrom.getResource()))
+          if (!user) {
+            this.emit('warn', `No user ${messageFrom.getResource()}`)
+            return false
+          }
+          messageUser = user.jid
+        }
         stanza.id = uuid.v1()
-        stanza.to = new XmppClient.JID(stanza.attrs.to)
-        stanza.from = new XmppClient.JID(stanza.attrs.from)
-        stanza.text = stanza.getChildText('body')
+        stanza.text = stanza.getChildText('body') || ''
         // if this is a message 'from' the bot-- it is a reply
-        if (Object.is(this.profile.jid.bare().toString(), stanza.from.bare().toString())) {
+        if (Object.is(this.profile.jid.bare().toString(), messageUser.bare().toString())) {
           this.emit('reply', stanza)
           return true
         }
@@ -168,36 +182,50 @@ module.exports =
           dialogId: this.options.defaultDialogId,
           dialogArgs: {}
         })
-        let getSession = Promise.promisify(this.options.sessionStore.get.bind(this.options.sessionStore))
         Promise.join(
-          getSession(stanza.from.bare().toString()),
-          this.getUserData(stanza.from)
+          this.getSessionData(messageUser),
+          this.getUserData(messageUser)
         ).then((arg) => {
           let sessionData = arg[0]
           let userData = arg[1]
           ses.userData = userData || {}
           // pull in the user from the directory
-          ses.userData.identity = this.directory[stanza.from.bare().toString()]
-          ses.dispatch(sessionData, stanza)
+          ses.userData.identity = this.directory[messageUser.bare().toString()]
+          if (Object.is(stanza.attrs.type, 'groupchat')) {
+            let filter = Promise.promisify(this.groupFilter || ((sessionData, stanza, cb) => cb(null, true) ))
+            filter(sessionData, stanza)
+              .then((shouldDispatch) => {
+                if (shouldDispatch) {
+                  ses.dispatch(sessionData, stanza)
+                  ret = true
+                }
+              })
+          } else {
+            ses.dispatch(sessionData, stanza)
+            stanza.getChildText('body')
+          }
         })
         // observe the session, and forward sends back to the server after saving data
         ses.on('send', (msg) => {
           if (!msg) return
-          let setSession = Promise.promisify(this.options.sessionStore.save.bind(this.options.sessionStore))
           Promise.join(
-            setSession(stanza.from.bare().toString(), ses.sessionState),
-            this.setUserData(stanza.from, ses.userData)
+            this.setSessionData(messageUser, ses.sessionState),
+            this.setUserData(messageUser, ses.userData)
           ).then(() => {
-            let backToWho = this.directory[stanza.from.bare().toString()]
-            this.send(stanza.from, msg.text)
+            if (Object.is(stanza.attrs.type, 'chat')) {
+              this.send(messageFrom, msg.text)
+              messageUser = messageFrom
+            }
+            if (Object.is(stanza.attrs.type, 'groupchat')) {
+              this.sendChat(messageFrom, msg.text)
+            }
             this.emit('send', msg)
           })
         })
-        return true
       }
+      return ret
     }
 
-    
     /**
      * This bot is what we'd call 'a joiner'. All invites get an immediate join response to
      * the room.
@@ -216,7 +244,7 @@ module.exports =
                 .c('x', { xmlns: 'http://jabber.org/protocol/muc' })
                 .c('history', {
                   xmlns: 'http://jabber.org/protocol/muc',
-                  maxstanzas: '20'
+                  maxstanzas: '2'
                 })
                 .root()
             )
@@ -250,6 +278,30 @@ module.exports =
     }
 
     /**
+     * Promise to get the data for a single user, and comes back undefined to 
+     * allow botbuilder to set up the session
+     * 
+     * @param jid - identifies which user
+     * @returns {Promise} - resolves to the user data
+     */
+    getSessionData (jid) {
+      return Promise.promisify(this.options.sessionStore.get.bind(this.options.sessionStore))(jid.bare().toString())
+        .then((userdata) => userdata)
+    }
+
+    /**
+     * Promise to set the data for a single user.
+     * 
+     * @param jid - identifies which user
+     * @param data - the user data profile
+     * @returns {Promise} - resolves to the user data
+     */
+    setSessionData (jid, data) {
+      return Promise.promisify(this.options.sessionStore.save.bind(this.options.sessionStore))(jid.bare().toString(), data)
+        .then(() => data)
+    }
+
+    /**
      * Send a quick message outside of a dialog session.
      * 
      * @param to - JID of the target
@@ -267,7 +319,31 @@ module.exports =
           .c('x', {xmlns: 'http://hipchat.com'})
           .c('echo')
           .root()
-          .c('time', {xmlns: 'urn:xmpp:time'}).root()
+          .c('time', {xmlns: 'urn:  xmpp:time'}).root()
+      )
+      return new Promise((resolve) => {
+        this.resolvers[id] = resolve
+      })
+    }
+
+    /**
+     * Send a quick group message.
+     * 
+     * @param room - JID of the target room
+     * @param message - body text for the message
+     * @returns {Promise} - resolved on message receipt
+     */
+    sendChat (room, message) {
+      let id = uuid.v1()
+      this.client.send(
+        new XmppClient.Stanza('message', {id, to: `${room.bare().toString()}/${this.profile.FN}`, type: 'groupchat'})
+          .c('body')
+          .t(message)
+          .root()
+          .c('x', {xmlns: 'http://hipchat.com'})
+          .c('echo')
+          .root()
+          .c('time', {xmlns: 'urn:  xmpp:time'}).root()
       )
       return new Promise((resolve) => {
         this.resolvers[id] = resolve
