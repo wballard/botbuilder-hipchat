@@ -18,7 +18,7 @@
   "homepage": "https://github.com/wballard/botbuilder-hipchat#readme",
   "dependencies": {
     "bluebird": "^3.3.5",
-    "botbuilder": "0.8.0",
+    "botbuilder": "0.9.2",
     "dotenv": "^2.0.0",
     "lodash": "^4.11.1",
     "moment": "^2.12.0",
