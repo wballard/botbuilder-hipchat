@@ -46,7 +46,7 @@ module.exports =
       return new Promise((resolve) => {
         let id = `profile:${uuid.v1()}`
         resolvers[id] = resolve
-        client.send(new XmppClient.Stanza('iq', {id: id, to: jid.bare().toString(), type: 'get'})
+        client.send(new XmppClient.Stanza('iq', {id: id, to: jid, type: 'get'})
           .c('query', {xmlns: 'http://hipchat.com/protocol/profile'})
           .up().c('time', {xmlns: 'urn:xmpp:time'}).root())
       })
@@ -60,7 +60,7 @@ module.exports =
      */
     maybeVCard (stanza) {
       if (Object.is(stanza.name, 'iq') && stanza.getChild('vCard')) {
-        this.profile.jid = new XmppClient.JID(stanza.attrs.to)
+        this.profile.jid = new XmppClient.JID(stanza.attrs.to).bare.toString()
         stanza.getChild('vCard').children.forEach((field) => this.profile[field.name] = field.getText())
         debug('bot profile', JSON.stringify(this.profile))
         return true
@@ -76,10 +76,10 @@ module.exports =
     maybeProfile (stanza) {
       // may be a single person, look them up or make a profile record
       if (Object.is(stanza.name, 'iq') && (stanza.attrs.id || '').indexOf('profile:') == 0) {
-        let jid = new XmppClient.JID(stanza.attrs.from)
+        let jid = new XmppClient.JID(stanza.attrs.from).bare().toString()
         let buddy = undefined
-        if (this.directory[jid.bare().toString()]) {
-          buddy = this.directory[jid.bare().toString()]
+        if (this.directory[jid]) {
+          buddy = this.directory[jid]
         } else {
           buddy = {}
         }
@@ -93,7 +93,11 @@ module.exports =
           this.emit('error', e)
         }
         debug('hi', JSON.stringify(buddy))
-        this.directory[jid.bare().toString()] = buddy
+        this.directory[jid] = buddy
+        let resolver = this.resolvers[stanza.attrs.id]
+        if (resolver) {
+          resolver(buddy)
+        }
         return true
       }
     }
@@ -109,13 +113,13 @@ module.exports =
       let query = stanza.getChild('query')
       if (query && query.getChildren('item')) {
         (query.getChildren('item') || []).forEach((el) => {
-          let jid = new XmppClient.JID(el.attrs.jid)
-          let buddy = this.directory[jid.bare().toString()] || {}
+          let jid = new XmppClient.JID(el.attrs.jid).bare().toString()
+          let buddy = this.directory[jid] || {}
           buddy.jid = jid
           buddy.name = el.attrs.name
           buddy.mention_name = el.attrs.mention_name
           debug('profile', JSON.stringify(buddy))
-          this.directory[jid.bare().toString()] = buddy
+          this.directory[jid] = buddy
         })
         return true
       }
@@ -128,13 +132,13 @@ module.exports =
      */
     maybePresence (stanza) {
       if (Object.is(stanza.name, 'presence')) {
-        let jid = new XmppClient.JID(stanza.attrs.from)
-        let buddy = this.directory[jid.bare().toString()] || {}
+        let jid = new XmppClient.JID(stanza.attrs.from).bare().toString()
+        let buddy = this.directory[jid] || {}
         let show = (stanza.getChildren('show') || []).map((i) => i.getText()).join('')
         show = show.length ? show : null
         buddy.presence = show || stanza.attrs.type || 'online'
         debug('presence', JSON.stringify(buddy))
-        this.directory[jid.bare().toString()] = buddy
+        this.directory[jid] = buddy
       }
     }
 
@@ -152,7 +156,7 @@ module.exports =
           return true
         }
         // the from / to is a bit when we are in groupchat
-        let messageFrom = new XmppClient.JID(stanza.attrs.from)
+        let messageFrom = new XmppClient.JID(stanza.attrs.from).bare().toString()
         let messageUser
         if (Object.is(stanza.attrs.type, 'chat')) {
           messageUser = messageFrom
@@ -169,7 +173,7 @@ module.exports =
         stanza.id = uuid.v1()
         stanza.text = stanza.getChildText('body') || ''
         // if this is a message 'from' the bot-- it is a reply
-        if (Object.is(this.profile.jid.bare().toString(), messageUser.bare().toString())) {
+        if (Object.is(this.profile.jid, messageUser)) {
           this.emit('reply', stanza)
           return true
         }
@@ -188,7 +192,7 @@ module.exports =
           let userData = arg[1]
           ses.userData = userData || {}
           // pull in the user from the directory
-          ses.userData.identity = this.directory[messageUser.bare().toString()]
+          ses.userData.identity = this.directory[messageUser]
           if (Object.is(stanza.attrs.type, 'groupchat')) {
             let filter = Promise.promisify(this.groupFilter || ((sessionData, stanza, cb) => cb(null, true) ))
             filter(sessionData, stanza)
@@ -259,7 +263,7 @@ module.exports =
      * @returns {Promise} - resolves to the user data
      */
     getUserData (jid) {
-      return Promise.promisify(this.options.userStore.get.bind(this.options.userStore))(jid.bare().toString())
+      return Promise.promisify(this.options.userStore.get.bind(this.options.userStore))(jid)
         .then((userdata) => userdata || {})
     }
 
@@ -271,7 +275,7 @@ module.exports =
      * @returns {Promise} - resolves to the user data
      */
     setUserData (jid, data) {
-      return Promise.promisify(this.options.userStore.save.bind(this.options.userStore))(jid.bare().toString(), data)
+      return Promise.promisify(this.options.userStore.save.bind(this.options.userStore))(jid, data)
         .then(() => data)
     }
 
@@ -283,7 +287,7 @@ module.exports =
      * @returns {Promise} - resolves to the user data
      */
     getSessionData (jid) {
-      return Promise.promisify(this.options.sessionStore.get.bind(this.options.sessionStore))(jid.bare().toString())
+      return Promise.promisify(this.options.sessionStore.get.bind(this.options.sessionStore))(jid)
         .then((userdata) => userdata)
     }
 
@@ -295,7 +299,7 @@ module.exports =
      * @returns {Promise} - resolves to the user data
      */
     setSessionData (jid, data) {
-      return Promise.promisify(this.options.sessionStore.save.bind(this.options.sessionStore))(jid.bare().toString(), data)
+      return Promise.promisify(this.options.sessionStore.save.bind(this.options.sessionStore))(jid, data)
         .then(() => data)
     }
 
@@ -307,7 +311,6 @@ module.exports =
      * @returns {Promise} - resolved on message receipt
      */
     send (to, message) {
-      to = new XmppClient.JID(to.toString()).bare().toString()
       let id = uuid.v1()
       this.client.send(
         new XmppClient.Stanza('message', {id, to, type: 'chat'})
@@ -334,7 +337,7 @@ module.exports =
     sendChat (room, message) {
       let id = uuid.v1()
       this.client.send(
-        new XmppClient.Stanza('message', {id, to: `${room.bare().toString()}/${this.profile.FN}`, type: 'groupchat'})
+        new XmppClient.Stanza('message', {id, to: `${room}/${this.profile.FN}`, type: 'groupchat'})
           .c('body')
           .t(message)
           .root()
