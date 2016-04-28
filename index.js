@@ -62,6 +62,7 @@ module.exports =
       if (Object.is(stanza.name, 'iq') && stanza.getChild('vCard')) {
         this.profile.jid = new XmppClient.JID(stanza.attrs.to)
         stanza.getChild('vCard').children.forEach((field) => this.profile[field.name] = field.getText())
+        debug('bot profile', JSON.stringify(this.profile))
         return true
       }
     }
@@ -93,8 +94,6 @@ module.exports =
         }
         debug('hi', JSON.stringify(buddy))
         this.directory[jid.bare().toString()] = buddy
-        let resolver = this.resolvers[stanza.attrs.id]
-        if (resolver) resolver(buddy)
         return true
       }
     }
@@ -149,7 +148,6 @@ module.exports =
       if (Object.is(stanza.name, 'message') && stanza.getChildText('body') && (Object.is(stanza.attrs.type, 'chat') || Object.is(stanza.attrs.type, 'groupchat'))) {
         // check for a resolver, this is an early exit as it is just an echo
         if (this.resolvers[stanza.attrs.id]) {
-          this.resolvers[stanza.attrs.id]()
           debug('receipt for', stanza.attrs.id)
           return true
         }
@@ -370,6 +368,12 @@ module.exports =
         this.maybeMessage(stanza) ||
         this.maybePresence(stanza) ||
         this.maybeInvite(stanza)
+
+        let resolver = this.resolvers[stanza.attrs.id]
+        if (resolver) {
+          resolver()
+          delete this.resolvers[stanza.attrs.id]
+        }
       })
 
       // promise for a complete online connection
@@ -377,10 +381,13 @@ module.exports =
         client.on('online', resolve)
       }).then(() => {
         // now we are online, start getting roster and status, along with a vcard for this bot itself
-        client.send(new XmppClient.Stanza('iq', { type: 'get' }).c('vCard', { xmlns: 'vcard-temp' }).root())
+        let vcardid = uuid.v1()
+        client.send(new XmppClient.Stanza('iq', {id: vcardid, type: 'get' }).c('vCard', { xmlns: 'vcard-temp' }).root())
         client.send(new XmppClient.Stanza('iq', { type: 'get' }).c('query', { xmlns: 'jabber:iq:roster' }).root())
         client.send(new XmppClient.Stanza('presence', {}).c('show').t('chat').up().c('status').t(this.options.status || '').root())
-        return true
+        return new Promise((resolve) => {
+          this.resolvers[vcardid] = resolve
+        })
       }).then(() => {
         // and start up a keepalive
         this.keepalive = setInterval(() => {
