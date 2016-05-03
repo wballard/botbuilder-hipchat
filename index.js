@@ -156,16 +156,16 @@ module.exports =
           return true
         }
         // the from / to is a bit when we are in groupchat
-        let messageFrom = new XmppClient.JID(stanza.attrs.from).bare().toString()
         let messageUser
         if (Object.is(stanza.attrs.type, 'chat')) {
-          messageUser = messageFrom
+          messageUser = new XmppClient.JID(stanza.attrs.from).bare().toString()
         }
         if (Object.is(stanza.attrs.type, 'groupchat')) {
+          let chatRoomUserName = new XmppClient.JID(stanza.attrs.from).getResource()
           let users = _.values(this.directory)
-          let user = _.find(users, (u) => Object.is(u.name, messageFrom.getResource()))
+          let user = _.find(users, (u) => Object.is(u.name, chatRoomUserName))
           if (!user) {
-            this.emit('warn', `No user ${messageFrom.getResource()}`)
+            this.emit('warn', `No user ${chatRoomUserName}`)
             return false
           }
           messageUser = user.jid
@@ -214,13 +214,8 @@ module.exports =
             this.setSessionData(messageUser, ses.sessionState),
             this.setUserData(messageUser, ses.userData)
           ).then(() => {
-            if (Object.is(stanza.attrs.type, 'chat')) {
-              this.send(messageFrom, msg.text)
-              messageUser = messageFrom
-            }
-            if (Object.is(stanza.attrs.type, 'groupchat')) {
-              this.sendChat(messageFrom, msg.text)
-            }
+            let replyTo = new XmppClient.JID(stanza.attrs.from).bare().toString()
+            this.send(replyTo, msg.text, stanza.attrs.type)
             this.emit('send', msg)
           })
         })
@@ -310,10 +305,10 @@ module.exports =
      * @param message - body text for the message
      * @returns {Promise} - resolved on message receipt
      */
-    send (to, message) {
+    send (to, message, type) {
       let id = uuid.v1()
       this.client.send(
-        new XmppClient.Stanza('message', {id, to, type: 'chat'})
+        new XmppClient.Stanza('message', {id, to, type})
           .c('body')
           .t(message)
           .root()
